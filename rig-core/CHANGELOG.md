@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.1](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.26.0...rig-core-v0.26.1) - 2025-12-07
+
+### Fixed
+
+- *(rig-1082)* unnecessary JSON flatten ([#1127](https://github.com/0xPlaygrounds/rig/pull/1127))
+- OpenAI Chat Completions API tool result format and strict mode support ([#1117](https://github.com/0xPlaygrounds/rig/pull/1117))
+- *(rig-1081)* oneOf not supported by OpenAI tool calling ([#1124](https://github.com/0xPlaygrounds/rig/pull/1124))
+
+### Other
+
+- fix API key censoring ([#1128](https://github.com/0xPlaygrounds/rig/pull/1128))
+- deny `dbg!`, `todo!`, and `unimplemented!` in CI ([#1121](https://github.com/0xPlaygrounds/rig/pull/1121))
+
 ## [0.26.0](https://github.com/0xPlaygrounds/rig/compare/rig-core-v0.25.0...rig-core-v0.26.0) - 2025-12-04
 
 ### Added
