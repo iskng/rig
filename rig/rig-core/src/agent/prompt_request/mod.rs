@@ -6,7 +6,7 @@ use std::{
     future::IntoFuture,
     marker::PhantomData,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -32,6 +32,15 @@ pub struct Extended;
 
 impl PromptType for Standard {}
 impl PromptType for Extended {}
+
+/// Control flow action for tool call hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolCallHookAction {
+    /// Continue tool execution as normal.
+    Continue,
+    /// Skip tool execution and return the provided reason as the tool result.
+    Skip { reason: String },
+}
 
 /// A builder for creating prompt requests with customizable options.
 /// Uses generics to track which options have been set during the build process.
@@ -73,7 +82,7 @@ where
         Self {
             prompt: prompt.into(),
             chat_history: None,
-            max_depth: 0,
+            max_depth: agent.default_max_depth.unwrap_or_default(),
             agent,
             state: PhantomData,
             hook: None,
@@ -155,25 +164,48 @@ where
     }
 }
 
-pub struct CancelSignal(Arc<AtomicBool>);
+/// Handles cancellations from a [`PromptHook`] in an agentic loop.
+/// Upon using `CancelSignal::cancel()`, the agent loop will terminate early, providing the messages generated so far.
+/// You can additionally add a reason for early termination with `CancelSignal::cancel_with_reason()`.
+pub struct CancelSignal {
+    sig: Arc<AtomicBool>,
+    reason: Arc<OnceLock<String>>,
+}
 
 impl CancelSignal {
     fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self {
+            sig: Arc::new(AtomicBool::new(false)),
+            reason: Arc::new(OnceLock::new()),
+        }
     }
 
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.sig.store(true, Ordering::SeqCst);
+    }
+
+    pub fn cancel_with_reason(&self, reason: &str) {
+        // SAFETY: This can only be set once. We immediately return once the prompt hook is finished if the internal AtomicBool is set to true
+        // It is technically on the user to return early when using this in a prompt hook, but this is relatively obvious
+        let _ = self.reason.set(reason.to_string());
+        self.cancel();
     }
 
     fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.sig.load(Ordering::SeqCst)
+    }
+
+    fn cancel_reason(&self) -> Option<&str> {
+        self.reason.get().map(|x| x.as_str())
     }
 }
 
 impl Clone for CancelSignal {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            sig: self.sig.clone(),
+            reason: self.reason.clone(),
+        }
     }
 }
 
@@ -207,14 +239,18 @@ where
 
     #[allow(unused_variables)]
     /// Called before a tool is invoked.
+    ///
+    /// # Returns
+    /// - `ToolCallHookAction::Continue` - Allow tool execution to proceed
+    /// - `ToolCallHookAction::Skip { reason }` - Reject tool execution; `reason` will be returned to the LLM as the tool result
     fn on_tool_call(
         &self,
         tool_name: &str,
         tool_call_id: Option<String>,
         args: &str,
         cancel_sig: CancelSignal,
-    ) -> impl Future<Output = ()> + WasmCompatSend {
-        async {}
+    ) -> impl Future<Output = ToolCallHookAction> + WasmCompatSend {
+        async { ToolCallHookAction::Continue }
     }
 
     #[allow(unused_variables)]
@@ -355,7 +391,10 @@ where
                 )
                 .await;
                 if cancel_sig.is_cancelled() {
-                    return Err(PromptError::prompt_cancelled(chat_history.to_vec()));
+                    return Err(PromptError::prompt_cancelled(
+                        chat_history.to_vec(),
+                        cancel_sig.cancel_reason().unwrap_or("<no reason given>"),
+                    ));
                 }
             }
             let span = tracing::Span::current();
@@ -364,6 +403,7 @@ where
                 parent: &span,
                 "chat",
                 gen_ai.operation.name = "chat",
+                gen_ai.agent.name = self.agent.name(),
                 gen_ai.system_instructions = self.agent.preamble,
                 gen_ai.provider.name = tracing::field::Empty,
                 gen_ai.request.model = tracing::field::Empty,
@@ -402,7 +442,10 @@ where
                 hook.on_completion_response(&prompt, &resp, cancel_sig.clone())
                     .await;
                 if cancel_sig.is_cancelled() {
-                    return Err(PromptError::prompt_cancelled(chat_history.to_vec()));
+                    return Err(PromptError::prompt_cancelled(
+                        chat_history.to_vec(),
+                        cancel_sig.cancel_reason().unwrap_or("<no reason given>"),
+                    ));
                 }
             }
 
@@ -483,15 +526,38 @@ where
                             tool_span.record("gen_ai.tool.call.id", &tool_call.id);
                             tool_span.record("gen_ai.tool.call.arguments", &args);
                             if let Some(hook) = hook1 {
-                                hook.on_tool_call(
-                                    tool_name,
-                                    tool_call.call_id.clone(),
-                                    &args,
-                                    cancel_sig1.clone(),
-                                )
-                                .await;
+                                let action = hook
+                                    .on_tool_call(
+                                        tool_name,
+                                        tool_call.call_id.clone(),
+                                        &args,
+                                        cancel_sig1.clone(),
+                                    )
+                                    .await;
+
                                 if cancel_sig1.is_cancelled() {
                                     return Err(ToolSetError::Interrupted);
+                                }
+
+                                if let ToolCallHookAction::Skip { reason } = action {
+                                    // Tool execution rejected, return rejection message as tool result
+                                    tracing::info!(
+                                        tool_name = tool_name,
+                                        reason = reason,
+                                        "Tool call rejected"
+                                    );
+                                    if let Some(call_id) = tool_call.call_id.clone() {
+                                        return Ok(UserContent::tool_result_with_call_id(
+                                            tool_call.id.clone(),
+                                            call_id,
+                                            OneOrMany::one(reason.into()),
+                                        ));
+                                    } else {
+                                        return Ok(UserContent::tool_result(
+                                            tool_call.id.clone(),
+                                            OneOrMany::one(reason.into()),
+                                        ));
+                                    }
                                 }
                             }
                             let output =
@@ -547,7 +613,10 @@ where
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| {
                     if matches!(e, ToolSetError::Interrupted) {
-                        PromptError::prompt_cancelled(chat_history.to_vec())
+                        PromptError::prompt_cancelled(
+                            chat_history.to_vec(),
+                            cancel_sig.cancel_reason().unwrap_or("<no reason given>"),
+                        )
                     } else {
                         e.into()
                     }
