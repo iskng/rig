@@ -357,6 +357,11 @@ pub struct CompletionResponse<T> {
 pub trait GetTokenUsage {
     /// Returns token usage when the response type carries it.
     fn token_usage(&self) -> Option<crate::completion::Usage>;
+
+    /// Returns terminal metadata when the response type carries a provider finish reason.
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        None
+    }
 }
 
 impl GetTokenUsage for () {
@@ -375,6 +380,56 @@ where
         } else {
             None
         }
+    }
+
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        self.as_ref().and_then(GetTokenUsage::terminal_metadata)
+    }
+}
+
+/// Normalized reason a completion stream stopped producing output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CompletionFinishReason {
+    /// The provider reported a normal stop condition.
+    Stop,
+    /// The provider stopped because the request or model output limit was reached.
+    Length,
+    /// The provider stopped to return one or more tool calls.
+    ToolCalls,
+    /// The provider stopped because content was filtered or blocked by a safety policy.
+    ContentFilter,
+    /// The provider reported a terminal reason that Rig does not recognize.
+    Unknown,
+}
+
+/// Provider terminal metadata from a completion stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionTerminalMetadata {
+    /// Normalized finish reason.
+    pub reason: CompletionFinishReason,
+    /// Raw provider finish reason, when available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_reason: Option<String>,
+}
+
+impl CompletionTerminalMetadata {
+    pub fn new(reason: CompletionFinishReason) -> Self {
+        Self {
+            reason,
+            raw_reason: None,
+        }
+    }
+
+    pub fn with_raw_reason(mut self, raw_reason: impl Into<String>) -> Self {
+        self.raw_reason = Some(raw_reason.into());
+        self
+    }
+
+    pub fn raw_reason(&self) -> Option<&str> {
+        self.raw_reason.as_deref()
     }
 }
 
@@ -911,6 +966,21 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MetadataStreamingResponse {
+        terminal_metadata: Option<CompletionTerminalMetadata>,
+    }
+
+    impl GetTokenUsage for MetadataStreamingResponse {
+        fn token_usage(&self) -> Option<Usage> {
+            None
+        }
+
+        fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+            self.terminal_metadata.clone()
+        }
+    }
+
     impl CompletionModel for DummyModel {
         type Response = serde_json::Value;
         type StreamingResponse = DummyStreamingResponse;
@@ -949,6 +1019,31 @@ mod tests {
 
         let expected = "<file id: 123>\nThis is a test document.\n</file>\n";
         assert_eq!(format!("{doc}"), expected);
+    }
+
+    #[test]
+    fn get_token_usage_default_terminal_metadata_is_none() {
+        assert!(DummyStreamingResponse.terminal_metadata().is_none());
+    }
+
+    #[test]
+    fn option_get_token_usage_forwards_terminal_metadata() {
+        let response = Some(MetadataStreamingResponse {
+            terminal_metadata: Some(
+                CompletionTerminalMetadata::new(CompletionFinishReason::Length)
+                    .with_raw_reason("max_tokens"),
+            ),
+        });
+
+        let terminal_metadata = response
+            .terminal_metadata()
+            .expect("option should forward terminal metadata");
+
+        assert_eq!(terminal_metadata.reason, CompletionFinishReason::Length);
+        assert_eq!(terminal_metadata.raw_reason(), Some("max_tokens"));
+
+        let missing: Option<MetadataStreamingResponse> = None;
+        assert!(missing.terminal_metadata().is_none());
     }
 
     #[test]

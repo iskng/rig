@@ -10,7 +10,10 @@ use super::completion::{
     SystemContent, ToolChoice, ToolDefinition, Usage, apply_cache_control,
     split_system_messages_from_history,
 };
-use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
+use crate::completion::{
+    CompletionError, CompletionFinishReason, CompletionRequest, CompletionTerminalMetadata,
+    GetTokenUsage,
+};
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::http_client::{self, HttpClientExt};
 use crate::json_utils::merge_inplace;
@@ -118,6 +121,7 @@ struct ThinkingState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StreamingCompletionResponse {
     pub usage: PartialUsage,
+    pub terminal_metadata: Option<CompletionTerminalMetadata>,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
@@ -134,6 +138,22 @@ impl GetTokenUsage for StreamingCompletionResponse {
 
         Some(usage)
     }
+
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        self.terminal_metadata.clone()
+    }
+}
+
+fn terminal_metadata_from_stop_reason(stop_reason: &str) -> CompletionTerminalMetadata {
+    let reason = match stop_reason.trim().to_ascii_lowercase().as_str() {
+        "end_turn" | "stop_sequence" => CompletionFinishReason::Stop,
+        "max_tokens" | "model_context_window" => CompletionFinishReason::Length,
+        "tool_use" => CompletionFinishReason::ToolCalls,
+        "refusal" | "safety" | "content_filter" => CompletionFinishReason::ContentFilter,
+        _ => CompletionFinishReason::Unknown,
+    };
+
+    CompletionTerminalMetadata::new(reason).with_raw_reason(stop_reason.to_string())
 }
 
 impl<Ext, T> GenericCompletionModel<Ext, T>
@@ -299,6 +319,7 @@ where
             let mut sse_stream = Box::pin(stream);
             let mut input_tokens = 0;
             let mut final_usage = None;
+            let mut final_terminal_metadata = None;
 
             let mut text_content = String::new();
 
@@ -318,7 +339,7 @@ where
                                         span.record("gen_ai.response.model", &message.model);
                                     },
                                     StreamingEvent::MessageDelta { delta, usage } => {
-                                        if delta.stop_reason.is_some() {
+                                        if let Some(stop_reason) = delta.stop_reason.as_deref() {
                                             // cache_creation_input_tokens and cache_read_input_tokens
                                             // are cumulative totals on message_delta.usage per the
                                             // Anthropic streaming API spec — use them directly.
@@ -332,6 +353,7 @@ where
                                             let span = tracing::Span::current();
                                             span.record_token_usage(&usage);
                                             final_usage = Some(usage);
+                                            final_terminal_metadata = Some(terminal_metadata_from_stop_reason(stop_reason));
                                             break;
                                         }
                                     }
@@ -365,7 +387,8 @@ where
             sse_stream.close();
 
             yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-                usage: final_usage.unwrap_or_default()
+                usage: final_usage.unwrap_or_default(),
+                terminal_metadata: final_terminal_metadata,
             }))
         }.instrument(span));
 
@@ -511,6 +534,19 @@ fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_metadata_maps_anthropic_stop_reasons() {
+        let terminal_metadata = terminal_metadata_from_stop_reason("max_tokens");
+        assert_eq!(terminal_metadata.reason, CompletionFinishReason::Length);
+        assert_eq!(terminal_metadata.raw_reason(), Some("max_tokens"));
+
+        let terminal_metadata = terminal_metadata_from_stop_reason("tool_use");
+        assert_eq!(terminal_metadata.reason, CompletionFinishReason::ToolCalls);
+
+        let terminal_metadata = terminal_metadata_from_stop_reason("end_turn");
+        assert_eq!(terminal_metadata.reason, CompletionFinishReason::Stop);
+    }
 
     #[test]
     fn test_thinking_delta_deserialization() {

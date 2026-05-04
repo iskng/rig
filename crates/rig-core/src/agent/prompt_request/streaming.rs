@@ -2,7 +2,7 @@ use crate::{
     OneOrMany,
     agent::completion::{DynamicContextStore, build_completion_request},
     agent::prompt_request::{HookAction, hooks::PromptHook},
-    completion::{Document, GetTokenUsage},
+    completion::{CompletionFinishReason, CompletionTerminalMetadata, Document, GetTokenUsage},
     json_utils,
     message::{AssistantContent, ToolChoice, ToolResult, ToolResultContent, UserContent},
     streaming::{StreamedAssistantContent, StreamedUserContent},
@@ -51,6 +51,8 @@ pub struct FinalResponse {
     response: String,
     aggregated_usage: crate::completion::Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_metadata: Option<CompletionTerminalMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     history: Option<Vec<Message>>,
 }
 
@@ -59,6 +61,7 @@ impl FinalResponse {
         Self {
             response: String::new(),
             aggregated_usage: crate::completion::Usage::new(),
+            terminal_metadata: None,
             history: None,
         }
     }
@@ -70,6 +73,20 @@ impl FinalResponse {
 
     pub fn usage(&self) -> crate::completion::Usage {
         self.aggregated_usage
+    }
+
+    pub fn terminal_metadata(&self) -> Option<&CompletionTerminalMetadata> {
+        self.terminal_metadata.as_ref()
+    }
+
+    pub fn finish_reason(&self) -> Option<CompletionFinishReason> {
+        self.terminal_metadata()
+            .map(|terminal_metadata| terminal_metadata.reason)
+    }
+
+    pub fn raw_finish_reason(&self) -> Option<&str> {
+        self.terminal_metadata()
+            .and_then(CompletionTerminalMetadata::raw_reason)
     }
 
     pub fn history(&self) -> Option<&[Message]> {
@@ -86,6 +103,7 @@ impl<R> MultiTurnStreamItem<R> {
         Self::FinalResponse(FinalResponse {
             response: response.to_string(),
             aggregated_usage,
+            terminal_metadata: None,
             history: None,
         })
     }
@@ -98,6 +116,21 @@ impl<R> MultiTurnStreamItem<R> {
         Self::FinalResponse(FinalResponse {
             response: response.to_string(),
             aggregated_usage,
+            terminal_metadata: None,
+            history,
+        })
+    }
+
+    pub(crate) fn final_response_with_history_and_terminal_metadata(
+        response: &str,
+        aggregated_usage: crate::completion::Usage,
+        history: Option<Vec<Message>>,
+        terminal_metadata: Option<CompletionTerminalMetadata>,
+    ) -> Self {
+        Self::FinalResponse(FinalResponse {
+            response: response.to_string(),
+            aggregated_usage,
+            terminal_metadata,
             history,
         })
     }
@@ -398,6 +431,7 @@ where
         let output_schema = self.output_schema;
 
         let mut aggregated_usage = crate::completion::Usage::new();
+        let mut last_terminal_metadata = None;
 
         // NOTE: We use .instrument(agent_span) instead of span.enter() to avoid
         // span context leaking to other concurrent tasks. Using span.enter() inside
@@ -639,6 +673,7 @@ where
                         },
                         Ok(StreamedAssistantContent::Final(final_resp)) => {
                             if let Some(usage) = final_resp.token_usage() { aggregated_usage += usage; };
+                            last_terminal_metadata = final_resp.terminal_metadata();
                             if saw_text_this_turn {
                                 if let Some(ref hook) = self.hook &&
                                      let HookAction::Terminate { reason } = hook.on_stream_completion_response_finish(&current_prompt, &final_resp).await {
@@ -723,10 +758,11 @@ where
                     } else {
                         None
                     };
-                    yield Ok(MultiTurnStreamItem::final_response_with_history(
+                    yield Ok(MultiTurnStreamItem::final_response_with_history_and_terminal_metadata(
                         &turn_text_response,
                         aggregated_usage,
                         final_messages,
+                        last_terminal_metadata.clone(),
                     ));
                     break;
                 }
@@ -981,19 +1017,37 @@ mod tests {
     #[derive(Clone, Debug, Deserialize, Serialize)]
     struct MockStreamingResponse {
         usage: crate::completion::Usage,
+        terminal_metadata: Option<CompletionTerminalMetadata>,
     }
 
     impl MockStreamingResponse {
         fn new(total_tokens: u64) -> Self {
             let mut usage = crate::completion::Usage::new();
             usage.total_tokens = total_tokens;
-            Self { usage }
+            Self {
+                usage,
+                terminal_metadata: None,
+            }
+        }
+
+        fn with_terminal_metadata(
+            mut self,
+            reason: CompletionFinishReason,
+            raw_reason: impl Into<String>,
+        ) -> Self {
+            self.terminal_metadata =
+                Some(CompletionTerminalMetadata::new(reason).with_raw_reason(raw_reason));
+            self
         }
     }
 
     impl crate::completion::GetTokenUsage for MockStreamingResponse {
         fn token_usage(&self) -> Option<crate::completion::Usage> {
             Some(self.usage)
+        }
+
+        fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+            self.terminal_metadata.clone()
         }
     }
 
@@ -1178,6 +1232,7 @@ mod tests {
     enum FinalResponseScenario {
         TextThenFinal,
         FinalOnly,
+        TextThenTerminalFinal,
     }
 
     #[derive(Clone)]
@@ -1220,6 +1275,15 @@ mod tests {
                     }
                     FinalResponseScenario::FinalOnly => {
                         yield Ok(RawStreamingChoice::FinalResponse(MockStreamingResponse::new(1)));
+                    }
+                    FinalResponseScenario::TextThenTerminalFinal => {
+                        yield Ok(RawStreamingChoice::Message("truncated".to_string()));
+                        yield Ok(RawStreamingChoice::FinalResponse(
+                            MockStreamingResponse::new(3).with_terminal_metadata(
+                                CompletionFinishReason::Length,
+                                "max_output_tokens",
+                            ),
+                        ));
                     }
                 }
             };
@@ -1286,6 +1350,33 @@ mod tests {
 
         assert!(streamed_text.is_empty());
         assert_eq!(final_response_text.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn final_response_retains_provider_terminal_metadata() {
+        let agent = AgentBuilder::new(FinalResponseMockModel {
+            scenario: FinalResponseScenario::TextThenTerminalFinal,
+        })
+        .build();
+
+        let mut stream = agent.stream_prompt("say hello").await;
+        let mut terminal_metadata = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(MultiTurnStreamItem::FinalResponse(res)) => {
+                    terminal_metadata = res.terminal_metadata().cloned();
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) => panic!("unexpected streaming error: {err:?}"),
+            }
+        }
+
+        let terminal_metadata =
+            terminal_metadata.expect("final response should retain terminal metadata");
+        assert_eq!(terminal_metadata.reason, CompletionFinishReason::Length);
+        assert_eq!(terminal_metadata.raw_reason(), Some("max_output_tokens"));
     }
 
     /// Background task that logs periodically to detect span leakage.

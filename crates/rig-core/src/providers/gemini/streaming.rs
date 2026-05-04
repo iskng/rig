@@ -4,12 +4,15 @@ use serde::{Deserialize, Serialize};
 use tracing::{Level, enabled, info_span};
 use tracing_futures::Instrument;
 
-use super::completion::gemini_api_types::{ContentCandidate, Part, PartKind};
+use super::completion::gemini_api_types::{ContentCandidate, FinishReason, Part, PartKind};
 use super::completion::{
     CompletionModel, create_request_body, resolve_request_model, streaming_endpoint,
 };
 use crate::completion::message::ReasoningContent;
-use crate::completion::{CompletionError, CompletionRequest, GetTokenUsage};
+use crate::completion::{
+    CompletionError, CompletionFinishReason, CompletionRequest, CompletionTerminalMetadata,
+    GetTokenUsage,
+};
 use crate::http_client::HttpClientExt;
 use crate::http_client::sse::{Event, GenericEventSource};
 use crate::streaming;
@@ -55,6 +58,7 @@ pub struct StreamGenerateContentResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamingCompletionResponse {
     pub usage_metadata: PartialUsage,
+    pub terminal_metadata: Option<CompletionTerminalMetadata>,
 }
 
 impl GetTokenUsage for StreamingCompletionResponse {
@@ -69,6 +73,30 @@ impl GetTokenUsage for StreamingCompletionResponse {
         usage.input_tokens = self.usage_metadata.prompt_token_count as u64;
         Some(usage)
     }
+
+    fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
+        self.terminal_metadata.clone()
+    }
+}
+
+fn terminal_metadata_from_finish_reason(
+    finish_reason: &FinishReason,
+) -> CompletionTerminalMetadata {
+    let reason = match finish_reason {
+        FinishReason::Stop => CompletionFinishReason::Stop,
+        FinishReason::MaxTokens => CompletionFinishReason::Length,
+        FinishReason::Safety
+        | FinishReason::Recitation
+        | FinishReason::Language
+        | FinishReason::Blocklist
+        | FinishReason::ProhibitedContent
+        | FinishReason::Spii => CompletionFinishReason::ContentFilter,
+        FinishReason::FinishReasonUnspecified
+        | FinishReason::Other
+        | FinishReason::MalformedFunctionCall => CompletionFinishReason::Unknown,
+    };
+
+    CompletionTerminalMetadata::new(reason).with_raw_reason(format!("{finish_reason:?}"))
 }
 
 impl<T> CompletionModel<T>
@@ -121,6 +149,7 @@ where
 
         let stream = stream! {
             let mut final_usage = None;
+            let mut final_terminal_metadata = None;
             while let Some(event_result) = event_source.next().await {
                 match event_result {
                     Ok(Event::Open) => {
@@ -146,9 +175,18 @@ where
                             tracing::debug!("There is no content candidate");
                             continue;
                         };
+                        let finish_reason = choice.finish_reason.clone();
 
                         let Some(content) = choice.content else {
-                            tracing::debug!(finish_reason = ?choice.finish_reason, "Streaming candidate missing content");
+                            if let Some(finish_reason) = finish_reason.as_ref() {
+                                let span = tracing::Span::current();
+                                span.record_token_usage(&data.usage_metadata);
+                                final_usage = data.usage_metadata;
+                                final_terminal_metadata =
+                                    Some(terminal_metadata_from_finish_reason(finish_reason));
+                                break;
+                            }
+                            tracing::debug!(finish_reason = ?finish_reason, "Streaming candidate missing content");
                             continue;
                         };
 
@@ -210,10 +248,12 @@ where
                         }
 
                         // Check if this is the final response
-                        if choice.finish_reason.is_some() {
+                        if let Some(finish_reason) = finish_reason.as_ref() {
                             let span = tracing::Span::current();
                             span.record_token_usage(&data.usage_metadata);
                             final_usage = data.usage_metadata;
+                            final_terminal_metadata =
+                                Some(terminal_metadata_from_finish_reason(finish_reason));
                             break;
                         }
                     }
@@ -232,7 +272,8 @@ where
             event_source.close();
 
             yield Ok(streaming::RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
-                usage_metadata: final_usage.unwrap_or_default()
+                usage_metadata: final_usage.unwrap_or_default(),
+                terminal_metadata: final_terminal_metadata,
             }));
         }.instrument(span);
 
@@ -246,6 +287,22 @@ where
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn terminal_metadata_maps_gemini_finish_reasons() {
+        let terminal_metadata = terminal_metadata_from_finish_reason(&FinishReason::MaxTokens);
+        assert_eq!(terminal_metadata.reason, CompletionFinishReason::Length);
+        assert_eq!(terminal_metadata.raw_reason(), Some("MaxTokens"));
+
+        let terminal_metadata = terminal_metadata_from_finish_reason(&FinishReason::Safety);
+        assert_eq!(
+            terminal_metadata.reason,
+            CompletionFinishReason::ContentFilter
+        );
+
+        let terminal_metadata = terminal_metadata_from_finish_reason(&FinishReason::Stop);
+        assert_eq!(terminal_metadata.reason, CompletionFinishReason::Stop);
+    }
 
     #[test]
     fn test_deserialize_stream_response_with_single_text_part() {
@@ -551,6 +608,7 @@ mod tests {
                 thoughts_token_count: None,
                 prompt_token_count: 75,
             },
+            terminal_metadata: None,
         };
 
         let token_usage = response.token_usage().unwrap();

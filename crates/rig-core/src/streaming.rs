@@ -658,6 +658,21 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct MetadataResponse {
+        terminal_metadata: crate::completion::CompletionTerminalMetadata,
+    }
+
+    impl GetTokenUsage for MetadataResponse {
+        fn token_usage(&self) -> Option<crate::completion::Usage> {
+            None
+        }
+
+        fn terminal_metadata(&self) -> Option<crate::completion::CompletionTerminalMetadata> {
+            Some(self.terminal_metadata.clone())
+        }
+    }
+
     #[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
     fn to_stream_result(
         stream: impl futures::Stream<Item = Result<RawStreamingChoice<MockResponse>, CompletionError>>
@@ -687,6 +702,25 @@ mod tests {
         };
 
         StreamingCompletionResponse::stream(to_stream_result(stream))
+    }
+
+    #[cfg(not(all(feature = "wasm", target_arch = "wasm32")))]
+    fn to_metadata_stream_result(
+        stream: impl futures::Stream<
+            Item = Result<RawStreamingChoice<MetadataResponse>, CompletionError>,
+        > + Send
+        + 'static,
+    ) -> StreamingResult<MetadataResponse> {
+        Box::pin(stream)
+    }
+
+    #[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+    fn to_metadata_stream_result(
+        stream: impl futures::Stream<
+            Item = Result<RawStreamingChoice<MetadataResponse>, CompletionError>,
+        > + 'static,
+    ) -> StreamingResult<MetadataResponse> {
+        Box::pin(stream)
     }
 
     fn create_reasoning_stream() -> StreamingCompletionResponse<MockResponse> {
@@ -831,6 +865,36 @@ mod tests {
         // Test resume
         stream.resume();
         assert!(!stream.is_paused());
+    }
+
+    #[tokio::test]
+    async fn test_stream_final_response_preserves_terminal_metadata() {
+        let stream = stream! {
+            yield Ok(RawStreamingChoice::FinalResponse(MetadataResponse {
+                terminal_metadata: crate::completion::CompletionTerminalMetadata::new(
+                    crate::completion::CompletionFinishReason::Length,
+                )
+                .with_raw_reason("max_tokens"),
+            }));
+        };
+        let mut stream = StreamingCompletionResponse::stream(to_metadata_stream_result(stream));
+
+        let mut terminal_metadata = None;
+        while let Some(chunk) = stream.next().await {
+            if let StreamedAssistantContent::Final(response) =
+                chunk.expect("stream item should be ok")
+            {
+                terminal_metadata = response.terminal_metadata();
+            }
+        }
+
+        let terminal_metadata =
+            terminal_metadata.expect("final response should preserve terminal metadata");
+        assert_eq!(
+            terminal_metadata.reason,
+            crate::completion::CompletionFinishReason::Length
+        );
+        assert_eq!(terminal_metadata.raw_reason(), Some("max_tokens"));
     }
 
     #[tokio::test]
