@@ -121,6 +121,7 @@ struct ThinkingState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StreamingCompletionResponse {
     pub usage: PartialUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_metadata: Option<CompletionTerminalMetadata>,
 }
 
@@ -534,6 +535,10 @@ fn handle_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::completion::{CompletionModel as _, GetTokenUsage};
+    use crate::http_client::mock::MockStreamingClient;
+    use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
+    use crate::streaming::StreamedAssistantContent;
 
     #[test]
     fn terminal_metadata_maps_anthropic_stop_reasons() {
@@ -546,6 +551,62 @@ mod tests {
 
         let terminal_metadata = terminal_metadata_from_stop_reason("end_turn");
         assert_eq!(terminal_metadata.reason, CompletionFinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn streaming_final_response_preserves_anthropic_terminal_metadata() {
+        let message_start = serde_json::json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-test",
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 0
+                }
+            }
+        });
+        let message_delta = serde_json::json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "max_tokens",
+                "stop_sequence": null
+            },
+            "usage": {
+                "output_tokens": 5
+            }
+        });
+
+        let client = super::super::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[message_start, message_delta]),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = super::super::completion::CompletionModel::with_model(client, "claude-test");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        while let Some(item) = stream.next().await {
+            if let StreamedAssistantContent::Final(response) =
+                item.expect("stream item should be ok")
+            {
+                let terminal_metadata = response
+                    .terminal_metadata()
+                    .expect("final response should include terminal metadata");
+                assert_eq!(terminal_metadata.reason, CompletionFinishReason::Length);
+                assert_eq!(terminal_metadata.raw_reason(), Some("max_tokens"));
+                return;
+            }
+        }
+
+        panic!("stream should yield a final response");
     }
 
     #[test]

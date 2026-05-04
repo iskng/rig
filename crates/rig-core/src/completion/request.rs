@@ -375,11 +375,7 @@ where
     T: GetTokenUsage,
 {
     fn token_usage(&self) -> Option<crate::completion::Usage> {
-        if let Some(usage) = self {
-            usage.token_usage()
-        } else {
-            None
-        }
+        self.as_ref().and_then(GetTokenUsage::token_usage)
     }
 
     fn terminal_metadata(&self) -> Option<CompletionTerminalMetadata> {
@@ -416,6 +412,7 @@ pub struct CompletionTerminalMetadata {
 }
 
 impl CompletionTerminalMetadata {
+    /// Creates terminal metadata with a normalized finish reason.
     pub fn new(reason: CompletionFinishReason) -> Self {
         Self {
             reason,
@@ -423,11 +420,13 @@ impl CompletionTerminalMetadata {
         }
     }
 
+    /// Attaches the provider's raw finish reason.
     pub fn with_raw_reason(mut self, raw_reason: impl Into<String>) -> Self {
         self.raw_reason = Some(raw_reason.into());
         self
     }
 
+    /// Returns the provider's raw finish reason, when present.
     pub fn raw_reason(&self) -> Option<&str> {
         self.raw_reason.as_deref()
     }

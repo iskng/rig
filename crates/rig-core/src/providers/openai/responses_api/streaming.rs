@@ -41,6 +41,7 @@ pub struct StreamingCompletionResponse {
     /// Token usage
     pub usage: ResponsesUsage,
     /// Provider terminal metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_metadata: Option<CompletionTerminalMetadata>,
 }
 
@@ -201,7 +202,7 @@ impl ResponsesStreamOptions {
         Self::StrictWithImmediateToolCalls
     }
 
-    const fn errors_on_terminal_response(self) -> bool {
+    const fn errors_on_failed_response(self) -> bool {
         true
     }
 
@@ -402,7 +403,7 @@ impl RawChoiceAccumulator {
                 self.terminal_metadata = response_terminal_metadata(&kind, &response);
                 Ok(())
             }
-            ResponseChunkKind::ResponseFailed if options.errors_on_terminal_response() => {
+            ResponseChunkKind::ResponseFailed if options.errors_on_failed_response() => {
                 let error_message = response_chunk_error_message(&kind, &response, provider_name)
                     .unwrap_or_else(|| {
                         format!(

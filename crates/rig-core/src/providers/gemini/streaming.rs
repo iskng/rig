@@ -58,6 +58,7 @@ pub struct StreamGenerateContentResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamingCompletionResponse {
     pub usage_metadata: PartialUsage,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_metadata: Option<CompletionTerminalMetadata>,
 }
 
@@ -96,7 +97,23 @@ fn terminal_metadata_from_finish_reason(
         | FinishReason::MalformedFunctionCall => CompletionFinishReason::Unknown,
     };
 
-    CompletionTerminalMetadata::new(reason).with_raw_reason(format!("{finish_reason:?}"))
+    CompletionTerminalMetadata::new(reason).with_raw_reason(raw_finish_reason(finish_reason))
+}
+
+fn raw_finish_reason(finish_reason: &FinishReason) -> &'static str {
+    match finish_reason {
+        FinishReason::FinishReasonUnspecified => "FINISH_REASON_UNSPECIFIED",
+        FinishReason::Stop => "STOP",
+        FinishReason::MaxTokens => "MAX_TOKENS",
+        FinishReason::Safety => "SAFETY",
+        FinishReason::Recitation => "RECITATION",
+        FinishReason::Language => "LANGUAGE",
+        FinishReason::Other => "OTHER",
+        FinishReason::Blocklist => "BLOCKLIST",
+        FinishReason::ProhibitedContent => "PROHIBITED_CONTENT",
+        FinishReason::Spii => "SPII",
+        FinishReason::MalformedFunctionCall => "MALFORMED_FUNCTION_CALL",
+    }
 }
 
 impl<T> CompletionModel<T>
@@ -286,13 +303,17 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::completion::{CompletionModel as _, GetTokenUsage};
+    use crate::http_client::mock::MockStreamingClient;
+    use crate::providers::internal::openai_chat_completions_compatible::test_support::sse_bytes_from_json_events;
+    use crate::streaming::StreamedAssistantContent;
     use serde_json::json;
 
     #[test]
     fn terminal_metadata_maps_gemini_finish_reasons() {
         let terminal_metadata = terminal_metadata_from_finish_reason(&FinishReason::MaxTokens);
         assert_eq!(terminal_metadata.reason, CompletionFinishReason::Length);
-        assert_eq!(terminal_metadata.raw_reason(), Some("MaxTokens"));
+        assert_eq!(terminal_metadata.raw_reason(), Some("MAX_TOKENS"));
 
         let terminal_metadata = terminal_metadata_from_finish_reason(&FinishReason::Safety);
         assert_eq!(
@@ -302,6 +323,47 @@ mod tests {
 
         let terminal_metadata = terminal_metadata_from_finish_reason(&FinishReason::Stop);
         assert_eq!(terminal_metadata.reason, CompletionFinishReason::Stop);
+    }
+
+    #[tokio::test]
+    async fn streaming_final_response_preserves_gemini_terminal_metadata() {
+        let event = json!({
+            "candidates": [{
+                "finishReason": "MAX_TOKENS",
+                "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 5,
+                "totalTokenCount": 15
+            }
+        });
+
+        let client = super::super::Client::builder()
+            .http_client(MockStreamingClient {
+                sse_bytes: sse_bytes_from_json_events(&[event]),
+            })
+            .api_key("test-key")
+            .build()
+            .expect("client should build");
+        let model = super::super::completion::CompletionModel::with_model(client, "gemini-test");
+        let request = model.completion_request("hello").build();
+        let mut stream = model.stream(request).await.expect("stream should start");
+
+        while let Some(item) = stream.next().await {
+            if let StreamedAssistantContent::Final(response) =
+                item.expect("stream item should be ok")
+            {
+                let terminal_metadata = response
+                    .terminal_metadata()
+                    .expect("final response should include terminal metadata");
+                assert_eq!(terminal_metadata.reason, CompletionFinishReason::Length);
+                assert_eq!(terminal_metadata.raw_reason(), Some("MAX_TOKENS"));
+                return;
+            }
+        }
+
+        panic!("stream should yield a final response");
     }
 
     #[test]

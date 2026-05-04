@@ -634,6 +634,7 @@ struct StreamingCompletionChunk {
 #[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct StreamingCompletionResponse {
     pub usage: Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_metadata: Option<CompletionTerminalMetadata>,
 }
 

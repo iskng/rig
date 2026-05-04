@@ -536,6 +536,7 @@ struct StreamingCompletionChunk {
 pub struct StreamingCompletionResponse {
     /// Token usage from the streaming response.
     pub usage: openai::Usage,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_metadata: Option<CompletionTerminalMetadata>,
 }
 

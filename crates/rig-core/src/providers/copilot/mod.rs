@@ -1354,18 +1354,18 @@ impl CompatibleStreamProfile for CopilotChatCompatibleProfile {
                 &data.choices,
                 |choice| {
                     CompatibleChoiceData {
-                    terminal_metadata: choice.finish_reason.as_ref().map(|reason| {
-                        openai_chat_completions_compatible::terminal_metadata_from_raw_finish_reason(
-                            chat_raw_finish_reason(reason),
-                        )
-                    }),
-                    text: choice.delta.content.clone(),
-                    reasoning: choice.delta.reasoning_content.clone(),
-                    tool_calls: openai_chat_completions_compatible::tool_call_chunks(
-                        &choice.delta.tool_calls,
-                    ),
-                    details: Vec::new(),
-                }
+                        terminal_metadata: choice.finish_reason.as_ref().map(|reason| {
+                            openai_chat_completions_compatible::terminal_metadata_from_raw_finish_reason(
+                                chat_raw_finish_reason(reason),
+                            )
+                        }),
+                        text: choice.delta.content.clone(),
+                        reasoning: choice.delta.reasoning_content.clone(),
+                        tool_calls: openai_chat_completions_compatible::tool_call_chunks(
+                            &choice.delta.tool_calls,
+                        ),
+                        details: Vec::new(),
+                    }
                 },
             ),
         ))
